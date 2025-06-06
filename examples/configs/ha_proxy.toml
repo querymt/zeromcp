@@ -1,0 +1,15 @@
+[[service_mapping]]
+# The service type to scan for on the network.
+zeroconf_service = "_home-assistant._tcp.local."
+name = "HomeAssistant MCP"
+protocol = "stdio"
+command = "uvx"
+
+args = [
+    "mcp-proxy",
+    "http://{{service.hostname}}:{{service.port}}/mcp_server/sse"
+]
+
+# The library will detect that `API_TOKEN` is not a known service variable
+# and will prompt the user for its value.
+envs = { API_ACCESS_TOKEN = "{{API_TOKEN}}" }

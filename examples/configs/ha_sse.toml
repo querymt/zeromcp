@@ -1,0 +1,6 @@
+[[service_mapping]]
+zeroconf_service = "_home-assistant._tcp.local."
+name = "HomeAssistant MCP"
+protocol = "sse"
+url = "http://{{service.hostname}}:{{service.port}}/mcp_server/sse"
+headers = { "Authorization" = "Bearer {{API_TOKEN}}" }
