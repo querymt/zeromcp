@@ -2,6 +2,7 @@ use crate::{
     ZeroHandler,
     client::ZeroClient,
     config::{McpConfig, ZeroConfig},
+    mdns::MdnsBrowser,
     models::DiscoveredService,
     utils::hashmap_to_header_map,
 };
@@ -252,29 +253,25 @@ impl Actor for ServiceActor {
     }
 }
 
-pub struct ServiceManager {
+pub struct ServiceManager<M: MdnsBrowser> {
     actor: ActorRef<ServiceMessage>,
     config: ZeroConfig,
-    mdns: ServiceDaemon,
+    mdns: M,
     app_handler: Arc<dyn ZeroHandler>,
 }
 
-impl fmt::Debug for ServiceManager {
+impl<M: MdnsBrowser> fmt::Debug for ServiceManager<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServiceManager")
-            // These fields implement Debug, so we can print them normally.
             .field("actor", &self.actor)
             .field("config", &self.config)
-            // For fields that don't implement Debug, we print a placeholder string.
-            // This informs the developer that the field exists but cannot be displayed.
             .field("mdns", &"<ServiceDaemon>")
             .field("app_handler", &"<dyn ZeroHandler>")
-            // Finish building the debug output.
             .finish()
     }
 }
 
-impl ServiceManager {
+impl<M: MdnsBrowser + 'static> ServiceManager<M> {
     #[instrument(name = "service_manager_run", skip(self))]
     pub async fn run(&self) -> Result<()> {
         let mcp_map: HashMap<String, McpConfig> = self
@@ -527,6 +524,24 @@ where
     H: ZeroHandler + 'static,
     F: FnOnce(ZeroClient) -> Arc<H>,
 {
+    let mdns = ServiceDaemon::new()?;
+    start_with_mdns(config, make_handler, mdns).await
+}
+
+/// Start ZeroMCP with a specific `MdnsBrowser` implementation.
+///
+/// This is the core startup logic, made generic for testability. The public `start`
+/// function provides the real `mdns_sd::ServiceDaemon`.
+pub(crate) async fn start_with_mdns<H, F, M>(
+    config: ZeroConfig,
+    make_handler: F,
+    mdns: M,
+) -> Result<ZeroMcp>
+where
+    H: ZeroHandler + 'static,
+    F: FnOnce(ZeroClient) -> Arc<H>,
+    M: MdnsBrowser + 'static,
+{
     let (actor, _handle) = Actor::spawn(None, ServiceActor, ()).await?;
 
     let client = ZeroClient {
@@ -538,7 +553,7 @@ where
     let manager = ServiceManager {
         actor,
         config,
-        mdns: ServiceDaemon::new()?,
+        mdns,
         app_handler: handler,
     };
 

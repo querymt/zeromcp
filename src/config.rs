@@ -51,3 +51,72 @@ impl ZeroConfig {
         toml::from_str(&buf).context("parse zeroMCP config from reader")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_config_from_reader_valid() {
+        let toml_content = r#"
+            [[service_mapping]]
+            zeroconf_service = "_my-service._mcp._tcp.local."
+            protocol = "stdio"
+            name = "My Stdio Tool"
+            command = "/usr/bin/my_tool"
+            args = ["--stdio"]
+
+            [[service_mapping]]
+            zeroconf_service = "_sse-service._mcp._tcp.local."
+            protocol = "sse"
+            name = "My SSE Tool"
+            url = "http://localhost:8080/sse"
+        "#;
+        let config = ZeroConfig::from_reader(toml_content.as_bytes()).unwrap();
+
+        assert_eq!(config.service_mappings.len(), 2);
+
+        let stdio_mapping = &config.service_mappings[0];
+        assert_eq!(
+            stdio_mapping.zeroconf_service,
+            "_my-service._mcp._tcp.local."
+        );
+        if let McpConfig::Stdio { command, .. } = &stdio_mapping.mcp {
+            assert_eq!(command, "/usr/bin/my_tool");
+        } else {
+            panic!("Expected Stdio config");
+        }
+
+        let sse_mapping = &config.service_mappings[1];
+        assert_eq!(
+            sse_mapping.zeroconf_service,
+            "_sse-service._mcp._tcp.local."
+        );
+        if let McpConfig::Sse { url, .. } = &sse_mapping.mcp {
+            assert_eq!(url, "http://localhost:8080/sse");
+        } else {
+            panic!("Expected Sse config");
+        }
+    }
+
+    #[test]
+    fn test_load_config_from_reader_invalid_toml() {
+        let toml_content = "this is not toml";
+        let result = ZeroConfig::from_reader(toml_content.as_bytes());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_config_missing_required_field() {
+        let toml_content = r#"
+            [[service_mapping]]
+            # Missing zeroconf_service
+            protocol = "stdio"
+            name = "My Stdio Tool"
+            command = "/usr/bin/my_tool"
+            args = ["--stdio"]
+        "#;
+        let result = ZeroConfig::from_reader(toml_content.as_bytes());
+        assert!(result.is_err());
+    }
+}

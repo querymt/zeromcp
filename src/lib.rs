@@ -93,6 +93,7 @@ pub mod client;
 pub mod config;
 pub mod events;
 pub mod manager;
+pub mod mdns;
 pub mod models;
 mod utils;
 
