@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::{collections::HashMap, io::Read, path::Path};
 
 /// Represents the top-level configuration loaded from a TOML file.
 #[derive(Deserialize, Debug, Clone)]
@@ -37,9 +37,17 @@ pub enum McpConfig {
 
 impl ZeroConfig {
     /// Loads configuration from a TOML file.
-    pub fn load(path: &str) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file at '{}'", path))?;
-        toml::from_str(&content).with_context(|| format!("Failed to parse TOML from '{}'", path))
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("read config from {:?}", path.as_ref()))?;
+        toml::from_str(&content).context("parse zeroMCP config")
+    }
+
+    pub fn from_reader<R: Read>(reader: R) -> Result<Self> {
+        // Parse TOML from any reader:
+        let mut buf = String::new();
+        let mut rdr = reader;
+        rdr.read_to_string(&mut buf)?;
+        toml::from_str(&buf).context("parse zeroMCP config from reader")
     }
 }

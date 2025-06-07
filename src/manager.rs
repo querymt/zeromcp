@@ -1,49 +1,166 @@
-use crate::config::{McpConfig, ZeroConfig};
-use crate::models::{ClientNotification, DiscoveredService};
-use crate::utils::hashmap_to_header_map;
-
-use anyhow::{Context, Result};
+use crate::{
+    ZeroHandler,
+    client::ZeroClient,
+    config::{McpConfig, ZeroConfig},
+    models::DiscoveredService,
+    utils::hashmap_to_header_map,
+};
+use anyhow::{Context, Result, anyhow};
 use futures::stream::StreamExt;
 use handlebars::{Handlebars, RenderErrorReason};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
-use rmcp::service::DynService;
-use rmcp::transport::sse_client::SseClientConfig;
+use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 use rmcp::{
     RoleClient, ServiceExt,
-    service::RunningService,
-    transport::{SseClientTransport, child_process::TokioChildProcess},
+    model::Tool,
+    service::{DynService, QuitReason, RunningService},
+    transport::{
+        SseClientTransport, child_process::TokioChildProcess, sse_client::SseClientConfig,
+    },
 };
 use serde_json::json;
-use std::collections::HashMap;
-use std::process::Stdio;
-use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot};
+use std::{collections::HashMap, fmt, process::Stdio, sync::Arc};
+use tokio::task::JoinHandle;
+use tracing::{Span, debug, error, info, instrument, warn};
 
-/// The main struct for managing the service lifecycle.
-pub struct ServiceManager {
-    config: ZeroConfig,
-    mdns: ServiceDaemon,
-    notification_tx: mpsc::Sender<ClientNotification>,
-    active_services:
-        Arc<Mutex<HashMap<String, RunningService<RoleClient, Box<dyn DynService<RoleClient>>>>>>,
+pub enum ServiceMessage {
+    AddService {
+        name: String,
+        service: McpClient,
+    },
+    CancelService {
+        name: String,
+        reply: RpcReplyPort<Result<QuitReason>>,
+    },
+    ListTools {
+        service_name: String,
+        reply: RpcReplyPort<Result<Vec<Tool>>>,
+    },
 }
 
-impl ServiceManager {
-    /// Creates a new `ServiceManager`.
-    pub fn new(
-        config: ZeroConfig,
-        notification_tx: mpsc::Sender<ClientNotification>,
-    ) -> Result<Self> {
-        Ok(Self {
-            config,
-            mdns: ServiceDaemon::new()?,
-            notification_tx,
-            active_services: Arc::new(Mutex::new(HashMap::new())),
+impl fmt::Debug for ServiceMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // For the variant with the non-Debug field:
+            Self::AddService { name, .. } => f
+                .debug_struct("AddService")
+                .field("name", name)
+                // We provide a placeholder string for the problematic field
+                .field("service", &"<McpClient>")
+                .finish(),
+
+            // For variants where all fields are Debug, we can print them normally:
+            Self::CancelService { name, reply } => f
+                .debug_struct("CancelService")
+                .field("name", name)
+                .field("reply", reply)
+                .finish(),
+
+            Self::ListTools {
+                service_name,
+                reply,
+            } => f
+                .debug_struct("ListTools")
+                .field("service_name", service_name)
+                .field("reply", reply)
+                .finish(),
+        }
+    }
+}
+
+pub struct ActorState {
+    active_services: HashMap<String, McpClient>,
+}
+
+pub struct ServiceActor;
+pub type McpClient = RunningService<RoleClient, Box<dyn DynService<RoleClient>>>;
+
+#[async_trait::async_trait]
+impl Actor for ServiceActor {
+    type Msg = ServiceMessage;
+    type State = ActorState;
+    type Arguments = ();
+
+    async fn pre_start(
+        &self,
+        _myself: ActorRef<Self::Msg>,
+        _args: Self::Arguments,
+    ) -> Result<Self::State, ActorProcessingErr> {
+        Ok(ActorState {
+            active_services: HashMap::new(),
         })
     }
 
-    /// Runs the main event loop, continuously monitoring for services.
-    /// This function runs forever until an error occurs.
+    #[instrument(name = "service_actor_handle", skip(self, _myself, state), fields(message_type = std::any::type_name::<ServiceMessage>()))]
+    async fn handle(
+        &self,
+        _myself: ActorRef<Self::Msg>,
+        message: Self::Msg,
+        state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        match message {
+            ServiceMessage::AddService { name, service } => {
+                info!("Tracking new active service: {}", name);
+                state.active_services.insert(name, service);
+            }
+            ServiceMessage::CancelService { name, reply } => {
+                let result = if let Some(service) = state.active_services.remove(&name) {
+                    service.cancel().await.map_err(|e| e.into())
+                } else {
+                    Err(anyhow!("Service '{}' not found for cancellation.", name))
+                };
+                if let Err(e) = &result {
+                    warn!(
+                        "Failed to cleanly cancel service '{}': {}",
+                        name,
+                        e.to_string()
+                    );
+                }
+                let _ = reply.send(result);
+            }
+            ServiceMessage::ListTools {
+                service_name,
+                reply,
+            } => {
+                let result = if let Some(service) = state.active_services.get(&service_name) {
+                    service.list_all_tools().await.map_err(|e| e.into())
+                } else {
+                    Err(anyhow!(
+                        "Service '{}' not found to list tools.",
+                        service_name
+                    ))
+                };
+                let _ = reply.send(result);
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct ServiceManager {
+    actor: ActorRef<ServiceMessage>,
+    config: ZeroConfig,
+    mdns: ServiceDaemon,
+    app_handler: Arc<dyn ZeroHandler>,
+}
+
+impl fmt::Debug for ServiceManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceManager")
+            // These fields implement Debug, so we can print them normally.
+            .field("actor", &self.actor)
+            .field("config", &self.config)
+            // For fields that don't implement Debug, we print a placeholder string.
+            // This informs the developer that the field exists but cannot be displayed.
+            .field("mdns", &"<ServiceDaemon>")
+            .field("app_handler", &"<dyn ZeroHandler>")
+            // Finish building the debug output.
+            .finish()
+    }
+}
+
+impl ServiceManager {
+    #[instrument(name = "service_manager_run", skip(self))]
     pub async fn run(&self) -> Result<()> {
         let mcp_map: HashMap<String, McpConfig> = self
             .config
@@ -52,224 +169,268 @@ impl ServiceManager {
             .map(|m| (m.zeroconf_service.clone(), m.mcp.clone()))
             .collect();
 
-        // Browse for all unique service types from the config.
         let mut streams = Vec::new();
         for service_type in mcp_map.keys() {
             let receiver = self.mdns.browse(service_type)?;
             streams.push(receiver.into_stream());
-            println!("[LIB] Browsing for '{}'...", service_type);
+            info!("Browsing for Zeroconf service type '{}'...", service_type);
         }
 
         let mut merged_stream = futures::stream::select_all(streams);
+        info!("Service discovery started. Awaiting events.");
 
-        while let Some(service_event) = merged_stream.next().await {
-            match service_event {
-                // The `match` is now directly on the `ServiceEvent` enum.
+        while let Some(event) = merged_stream.next().await {
+            match event {
                 ServiceEvent::ServiceResolved(info) => {
-                    println!("[LIB] Resolved: {}", info.get_fullname());
+                    let service_fullname = info.get_fullname().to_string();
+                    let service_type = info.get_type().to_string();
+                    let span = tracing::info_span!("service_resolved", service.fullname = %service_fullname, service.type = %service_type);
+                    let _enter = span.enter();
+
+                    info!("Resolved service");
                     if let Some(mcp_config) = mcp_map.get(info.get_type()) {
-                        self.handle_service_appeared(
-                            DiscoveredService::from(&info),
-                            mcp_config.clone(),
-                        );
+                        let service = DiscoveredService::from(&info);
+                        self.handle_service_appeared(service, mcp_config.clone());
+                    } else {
+                        warn!("No mapping found in config for service type");
                     }
                 }
-                ServiceEvent::ServiceRemoved(fullname, _) => {
-                    println!("[LIB] Removed: {}", fullname);
-                    self.handle_service_disappeared(&fullname);
+                ServiceEvent::ServiceRemoved(service_name, reason) => {
+                    let span =
+                        tracing::info_span!("service_removed", service.fullname = %service_name);
+                    let _enter = span.enter();
+
+                    info!("Service '{}' removed {}", service_name, reason);
+                    self.handle_service_disappeared(&service_name);
                 }
-                // Other event types like `ServiceFound` are ignored by the catch-all.
                 _ => {}
             }
         }
         Ok(())
     }
 
+    /// Renders a Handlebars template, prompting for user input if variables are missing.
+    #[instrument(name = "render_template", skip(ctx, app_handler), fields(service.name = %service_name, template = %tpl))]
+    async fn render_template_with_input(
+        tpl: &str,
+        ctx: &mut serde_json::Value,
+        service_name: &str,
+        app_handler: &Arc<dyn ZeroHandler>,
+    ) -> Result<String> {
+        let mut reg = Handlebars::new();
+        reg.set_strict_mode(true); // Ensures we fail on missing variables.
+
+        loop {
+            match reg.render_template(tpl, ctx) {
+                Ok(rendered) => return Ok(rendered),
+                Err(e) => match &*e.reason() {
+                    RenderErrorReason::MissingVariable(Some(var)) => {
+                        info!(variable = %var, "Template requires input");
+                        let val = app_handler
+                            .request_input(service_name, var)
+                            .await
+                            .with_context(|| {
+                                format!("Failed to get user input for key '{}'", var)
+                            })?;
+
+                        if let Some(obj) = ctx.as_object_mut() {
+                            obj.insert(var.clone(), json!(val));
+                        }
+                    }
+                    _ => return Err(e).context("Failed to render Handlebars template"),
+                },
+            }
+        }
+    }
+
+    /// Processes a discovered service's configuration to launch it.
+    #[instrument(name = "process_service", skip(cfg, service, app_handler), fields(service.name = %service.fullname))]
     async fn process_service_config(
         cfg: &McpConfig,
         service: &DiscoveredService,
-        notifier: &mpsc::Sender<ClientNotification>,
-    ) -> Result<RunningService<RoleClient, Box<dyn DynService<RoleClient>>>> {
-        async fn render_template(
-            tpl: &str,
-            ctx: &mut serde_json::Value,
-            svc_name: &str,
-            notifier: &mpsc::Sender<ClientNotification>,
-        ) -> Option<String> {
-            let mut reg = Handlebars::new();
-            // FIX: Strict mode MUST be enabled to detect missing variables via errors.
-            reg.set_strict_mode(true);
-
-            loop {
-                match reg.render_template(tpl, ctx) {
-                    Ok(out) => {
-                        return Some(out);
-                    }
-
-                    Err(e) => match &*e.reason() {
-                        RenderErrorReason::MissingVariable(Some(var)) => {
-                            let (tx, rx) = oneshot::channel();
-                            let note = ClientNotification::InputRequired {
-                                service_name: svc_name.to_string(),
-                                key: var.clone(),
-                                response_tx: tx,
-                            };
-                            if notifier.send(note).await.is_err() {
-                                return None;
-                            }
-                            match rx.await {
-                                Ok(val) => {
-                                    if let Some(obj) = ctx.as_object_mut() {
-                                        obj.insert(var.clone(), json!(val));
-                                    }
-                                }
-                                Err(_) => return None,
-                            }
-                        }
-                        _ => return None,
-                    },
-                }
-            }
-        }
-
+        app_handler: &Arc<dyn ZeroHandler>,
+    ) -> Result<McpClient> {
         let mut ctx = json!({ "service": service });
 
         match cfg {
             McpConfig::Stdio {
-                name,
                 command,
                 args,
                 envs,
+                ..
             } => {
                 let mut final_args = Vec::with_capacity(args.len());
-                for a in args {
-                    let arg = render_template(a, &mut ctx, name, notifier)
-                        .await
-                        .context(format!("[LIB] Arg-template failed for arg: '{}'", a))?;
+                for a_tpl in args {
+                    let arg = Self::render_template_with_input(
+                        a_tpl,
+                        &mut ctx,
+                        &service.fullname,
+                        app_handler,
+                    )
+                    .await?;
                     final_args.push(arg);
                 }
 
-                let mut child = tokio::process::Command::new(command);
+                let mut child_cmd = tokio::process::Command::new(command);
                 for (k, v_tpl) in envs {
-                    let v = render_template(v_tpl, &mut ctx, name, notifier)
-                        .await
-                        .context(format!("[LIB] Env-template failed for env var: '{}'", k))?;
-                    child.env(k, v);
+                    let v = Self::render_template_with_input(
+                        v_tpl,
+                        &mut ctx,
+                        &service.fullname,
+                        app_handler,
+                    )
+                    .await?;
+                    child_cmd.env(k, v);
                 }
 
-                child
+                info!(command = %command, args = ?final_args, "Spawning stdio process");
+                child_cmd
                     .args(&final_args)
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit());
-
-                let transport = TokioChildProcess::new(child)?;
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let transport = TokioChildProcess::new(child_cmd)?;
                 Ok(().into_dyn().serve(transport).await?)
             }
-            McpConfig::Sse { name, url, headers } => {
-                let url_str = render_template(&url, &mut ctx, &name, &notifier)
-                    .await
-                    .context("[LIB] SSE URL-template failed")?;
+            McpConfig::Sse { url, headers, .. } => {
+                let url_str =
+                    Self::render_template_with_input(url, &mut ctx, &service.fullname, app_handler)
+                        .await?;
+                let client_builder = reqwest::ClientBuilder::new();
 
-                let transport = match headers {
-                    Some(hdr) => {
-                        let mut rendered_map = HashMap::new();
-                        for (k, v_tpl) in hdr.iter() {
-                            let rendered_value: String =
-                                render_template(&v_tpl, &mut ctx, &name, notifier)
-                                    .await
-                                    .context(format!(
-                                        "[LIB] Env-template failed for env var: '{}'",
-                                        k
-                                    ))?;
-                            rendered_map.insert(k.clone(), rendered_value);
-                        }
-
-                        let default_headers = hashmap_to_header_map(&rendered_map)?;
-                        let client = reqwest::ClientBuilder::new()
-                            .default_headers(default_headers)
-                            .build()?;
-
-                        SseClientTransport::start_with_client(
-                            client,
-                            SseClientConfig {
-                                sse_endpoint: url_str.into(),
-                                ..Default::default()
-                            },
+                let client = if let Some(hdr) = headers {
+                    let mut rendered_map = HashMap::new();
+                    for (k, v_tpl) in hdr.iter() {
+                        let v = Self::render_template_with_input(
+                            v_tpl,
+                            &mut ctx,
+                            &service.fullname,
+                            app_handler,
                         )
-                        .await?
+                        .await?;
+                        rendered_map.insert(k.clone(), v);
                     }
-                    None => SseClientTransport::start(url_str).await?,
+                    let default_headers = hashmap_to_header_map(&rendered_map)?;
+                    client_builder.default_headers(default_headers).build()?
+                } else {
+                    client_builder.build()?
                 };
+
+                info!(url = %url_str, "Starting SSE transport");
+                let transport = SseClientTransport::start_with_client(
+                    client,
+                    SseClientConfig {
+                        sse_endpoint: url_str.into(),
+                        ..Default::default()
+                    },
+                )
+                .await?;
                 Ok(().into_dyn().serve(transport).await?)
             }
         }
     }
 
-    /// Handles spawning and managing a process when a service is discovered.
     fn handle_service_appeared(&self, service: DiscoveredService, cfg: McpConfig) {
-        let fullname = service.fullname.clone();
-        {
-            let map = self.active_services.lock().unwrap();
-            if map.contains_key(&fullname) {
-                println!("[LIB] '{}' already managed", fullname);
-                return;
-            }
-        }
-
-        let services = Arc::clone(&self.active_services);
-        let notifier = self.notification_tx.clone();
+        let actor_ref = self.actor.clone();
+        let app_handler = self.app_handler.clone();
 
         tokio::spawn(async move {
-            let serve_fut = ServiceManager::process_service_config(&cfg, &service, &notifier);
+            // Inherit the span from the parent task for better context in logs
+            let span = Span::current();
+            let _enter = span.enter();
 
-            match serve_fut.await {
-                Ok(service) => {
-                    services.lock().unwrap().insert(fullname.clone(), service);
-                    let _ = notifier
-                        .send(ClientNotification::McpStarted {
-                            service_name: fullname.clone(),
-                        })
-                        .await;
+            let service_fullname = service.fullname.clone();
+            let process_fut = Self::process_service_config(&cfg, &service, &app_handler);
+
+            match process_fut.await {
+                Ok(mcp_client) => {
+                    let msg = ServiceMessage::AddService {
+                        name: service_fullname.clone(),
+                        service: mcp_client,
+                    };
+
+                    if let Err(e) = actor_ref.cast(msg) {
+                        error!(error = %e, "Failed to send AddService message to actor");
+                    } else {
+                        // Notify the user's application logic.
+                        app_handler.on_service_started(&service).await;
+                    }
                 }
                 Err(e) => {
-                    eprintln!("[LIB] Failed to start MCP for '{}': '{}'", fullname, e);
+                    error!(error = ?e, "Failed to start MCP for service");
                 }
             }
         });
     }
 
-    /// Handles killing a managed process when its service disappears.
     fn handle_service_disappeared(&self, service_fullname: &str) {
-        if let Some(service) = self
-            .active_services
-            .lock()
-            .unwrap()
-            .remove(service_fullname)
-        {
-            println!("[LIB] Service '{}' disappeared.", service_fullname);
+        let client = ZeroClient {
+            actor: self.actor.clone(),
+        };
+        let name = service_fullname.to_string();
+        let app_handler = self.app_handler.clone();
 
-            let notifier = self.notification_tx.clone();
-            let service_name_owned = service_fullname.to_string();
-            tokio::spawn(async move {
-                match service.cancel().await {
-                    Ok(_) => {
-                        println!("[LIB] Process terminated successfully.");
-                        let notifier = notifier;
-                        let _ = notifier
-                            .send(ClientNotification::McpStopped {
-                                service_name: service_name_owned,
-                                reason: "Zeroconf service disappeared".to_string(),
-                            })
-                            .await;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[LIB] Failed to terminate process for '{}': {}",
-                            service_name_owned, e
-                        );
-                    }
+        tokio::spawn(async move {
+            let span = Span::current();
+            let _enter = span.enter();
+
+            match client.stop_service(&name).await {
+                Ok(reason) => {
+                    info!(reason = ?reason, "Service stopped successfully");
+                    app_handler.on_service_stopped(&name, reason).await;
                 }
-            });
-        }
+                Err(e) => {
+                    debug!(error = %e, "Error stopping service (it may have already been removed)");
+                }
+            }
+        });
     }
+}
+
+pub struct ZeroMcp {
+    client: ZeroClient,
+    // this handle will resolve when the manager finishes (signal or error)
+    task: JoinHandle<anyhow::Result<()>>,
+}
+
+impl ZeroMcp {
+    /// Returns the client you use to talk to running services.
+    pub fn client(&self) -> &ZeroClient {
+        &self.client
+    }
+
+    /// Signal the manager to shut down (if you build in a shutdown channel).
+    pub async fn shutdown(self) -> anyhow::Result<()> {
+        // e.g. drop client, send shutdown, await task.
+        self.task.await?
+    }
+}
+
+/// Start ZeroMCP, wiring your application logic into the background manager.
+/// Returns `(client, manager_handle)`.
+pub async fn start<H, F>(config: ZeroConfig, make_handler: F) -> Result<ZeroMcp>
+where
+    H: ZeroHandler + 'static,
+    F: FnOnce(ZeroClient) -> Arc<H>,
+{
+    let (actor, _handle) = Actor::spawn(None, ServiceActor, ()).await?;
+
+    let client = ZeroClient {
+        actor: actor.clone(),
+    };
+
+    let handler = make_handler(client.clone());
+
+    let manager = ServiceManager {
+        actor,
+        config,
+        mdns: ServiceDaemon::new()?,
+        app_handler: handler,
+    };
+
+    let handle = tokio::spawn(async move { manager.run().await });
+
+    Ok(ZeroMcp {
+        client,
+        task: handle,
+    })
 }
