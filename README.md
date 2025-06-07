@@ -80,7 +80,7 @@ struct MyApp {
 impl ServiceEventHandler for MyApp {
     async fn on_service_started(&self, svc: &DiscoveredService) {
         println!("Service started: {}", svc.fullname);
-        match self.client.list_tools(&svc.fullname).await {
+        match self.client.list_all_tools(&svc.fullname).await {
             Ok(tools) => for t in tools {
                 println!(" - {}: {}", t.name, t.description);
             },
@@ -138,7 +138,7 @@ let zeromcp = zeromcp::start(config, |client: ZeroClient| {
 }).await?;
 
 // Interact programmatically:
-let tools = zeromcp.client().list_tools("MyService._mcp._tcp.local.").await?;
+let tools = zeromcp.client().list_all_tools("MyService._mcp._tcp.local.").await?;
 let reason = zeromcp.client().stop_service("MyService._mcp._tcp.local.").await?;
 
 // Shutdown gracefully
@@ -149,7 +149,7 @@ Key types:
 - `ZeroConfig` – parse your service mappings from TOML
 - `McpConfig` – `Stdio { command, args, envs }` or `Sse { url, headers }`
 - `ZeroHandler` – your application logic (`ServiceEventHandler + UserInputProvider`)
-- `ZeroClient` – async API (`list_tools`, `stop_service`)
+- `ZeroClient` – async API (`list_all_tools`, `stop_service`)
 - `start(config, factory)` → `ZeroMcp` with `client()` & `shutdown()`
 
 ---

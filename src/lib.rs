@@ -42,7 +42,7 @@
 //!     async fn on_service_started(&self, service: &DiscoveredService) {
 //!         info!("[HANDLER] Service started: {}", service.fullname);
 //!         // Now you can use the client!
-//!         match self.client.list_tools(&service.fullname).await {
+//!         match self.client.list_all_tools(&service.fullname).await {
 //!             Ok(tools) => info!("[HANDLER] Found tools: {:?}", tools),
 //!             Err(e) => error!("[HANDLER] Failed to list tools: {}", e),
 //!         }

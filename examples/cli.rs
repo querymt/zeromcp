@@ -23,7 +23,7 @@ impl ServiceEventHandler for MyApplication {
     async fn on_service_started(&self, service: &DiscoveredService) {
         info!("[HANDLER] ==> Service started, querying for its tools...");
 
-        match self.client.list_tools(&service.fullname).await {
+        match self.client.list_all_tools(&service.fullname).await {
             Ok(tools) => {
                 info!("[HANDLER] <== Successfully retrieved tools:");
                 for tool in tools {

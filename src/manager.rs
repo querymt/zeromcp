@@ -12,7 +12,7 @@ use mdns_sd::{ServiceDaemon, ServiceEvent};
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 use rmcp::{
     RoleClient, ServiceExt,
-    model::Tool,
+    model::{GetPromptRequestParam, GetPromptResult, Prompt, Resource, ResourceTemplate, Tool},
     service::{DynService, QuitReason, RunningService},
     transport::{
         SseClientTransport, child_process::TokioChildProcess, sse_client::SseClientConfig,
@@ -32,9 +32,26 @@ pub enum ServiceMessage {
         name: String,
         reply: RpcReplyPort<Result<QuitReason>>,
     },
-    ListTools {
+    ListAllTools {
         service_name: String,
         reply: RpcReplyPort<Result<Vec<Tool>>>,
+    },
+    ListAllPrompts {
+        service_name: String,
+        reply: RpcReplyPort<Result<Vec<Prompt>>>,
+    },
+    ListAllResources {
+        service_name: String,
+        reply: RpcReplyPort<Result<Vec<Resource>>>,
+    },
+    ListAllResourceTemplates {
+        service_name: String,
+        reply: RpcReplyPort<Result<Vec<ResourceTemplate>>>,
+    },
+    GetPrompt {
+        service_name: String,
+        prompt_request: GetPromptRequestParam,
+        reply: RpcReplyPort<Result<GetPromptResult>>,
     },
 }
 
@@ -56,12 +73,46 @@ impl fmt::Debug for ServiceMessage {
                 .field("reply", reply)
                 .finish(),
 
-            Self::ListTools {
+            Self::ListAllTools {
                 service_name,
                 reply,
             } => f
                 .debug_struct("ListTools")
                 .field("service_name", service_name)
+                .field("reply", reply)
+                .finish(),
+            Self::ListAllPrompts {
+                service_name,
+                reply,
+            } => f
+                .debug_struct("ListAllPrompts")
+                .field("service_name", service_name)
+                .field("reply", reply)
+                .finish(),
+            Self::ListAllResources {
+                service_name,
+                reply,
+            } => f
+                .debug_struct("ListAllResources")
+                .field("service_name", service_name)
+                .field("reply", reply)
+                .finish(),
+            Self::ListAllResourceTemplates {
+                service_name,
+                reply,
+            } => f
+                .debug_struct("ListAllResourceTemplates")
+                .field("service_name", service_name)
+                .field("reply", reply)
+                .finish(),
+            Self::GetPrompt {
+                service_name,
+                prompt_request,
+                reply,
+            } => f
+                .debug_struct("GetPrompt")
+                .field("service_name", service_name)
+                .field("prompt_request", prompt_request)
                 .field("reply", reply)
                 .finish(),
         }
@@ -118,7 +169,7 @@ impl Actor for ServiceActor {
                 }
                 let _ = reply.send(result);
             }
-            ServiceMessage::ListTools {
+            ServiceMessage::ListAllTools {
                 service_name,
                 reply,
             } => {
@@ -128,6 +179,70 @@ impl Actor for ServiceActor {
                     Err(anyhow!(
                         "Service '{}' not found to list tools.",
                         service_name
+                    ))
+                };
+                let _ = reply.send(result);
+            }
+            ServiceMessage::ListAllPrompts {
+                service_name,
+                reply,
+            } => {
+                let result = if let Some(service) = state.active_services.get(&service_name) {
+                    service.list_all_prompts().await.map_err(|e| e.into())
+                } else {
+                    Err(anyhow!(
+                        "Service '{}' not found to list prompts.",
+                        service_name
+                    ))
+                };
+                let _ = reply.send(result);
+            }
+            ServiceMessage::ListAllResources {
+                service_name,
+                reply,
+            } => {
+                let result = if let Some(service) = state.active_services.get(&service_name) {
+                    service.list_all_resources().await.map_err(|e| e.into())
+                } else {
+                    Err(anyhow!(
+                        "Service '{}' not found to list resources.",
+                        service_name
+                    ))
+                };
+                let _ = reply.send(result);
+            }
+            ServiceMessage::ListAllResourceTemplates {
+                service_name,
+                reply,
+            } => {
+                let result = if let Some(service) = state.active_services.get(&service_name) {
+                    service
+                        .list_all_resource_templates()
+                        .await
+                        .map_err(|e| e.into())
+                } else {
+                    Err(anyhow!(
+                        "Service '{}' not found to list resource templates.",
+                        service_name
+                    ))
+                };
+                let _ = reply.send(result);
+            }
+            ServiceMessage::GetPrompt {
+                service_name,
+                prompt_request,
+                reply,
+            } => {
+                let result = if let Some(service) = state.active_services.get(&service_name) {
+                    service
+                        .get_prompt(prompt_request)
+                        .await
+                        .map_err(|e| e.into())
+                } else {
+                    Err(anyhow!(
+                        "Service '{}' not found to get prompt '{:?}'.",
+                        service_name,
+                        prompt_request
                     ))
                 };
                 let _ = reply.send(result);
