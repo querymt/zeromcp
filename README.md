@@ -6,13 +6,13 @@ and notifies your application about start/stop events or missing templating inpu
 
 ## Features
 
-• Automatic mDNS/ZeroConf service discovery
-• Dynamic MCP client spawning over stdio or SSE
-• Handlebars‐based templating for commands, URLs, headers & envs
-• Interactive callbacks when templates reference missing variables
-• Lifecycle management: start on discovery, stop on removal
-• Async notification callbacks for `McpStarted`, `McpStopped` & `InputRequired`
-• `ZeroClient` API to list tools or cancel services at runtime
+- Automatic mDNS/ZeroConf service discovery
+- Dynamic MCP client spawning over stdio or SSE
+- Handlebars‐based templating for commands, URLs, headers & envs
+- Interactive callbacks when templates reference missing variables
+- Lifecycle management: start on discovery, stop on removal
+- Async notification callbacks for `McpStarted`, `McpStopped` & `InputRequired`
+- `ZeroClient` API to list tools or cancel services at runtime
 
 ## Installation
 
